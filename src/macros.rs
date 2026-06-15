@@ -402,6 +402,127 @@ macro_rules! offset_of {
     }};
 }
 
+/// Generate a `Default` impl for a struct or union along with its definition.
+///
+/// Fields default to `Default::default()`. A field whose default can't be derived (like a
+/// `[T; N]` with `N > 32`) must carry `#[custom_default(EXPR)]` as its *first* attribute,
+/// and `EXPR` is used instead. Unions default to `mem::zeroed()` since all-zero is valid for
+/// the plain-data C unions libc wraps.
+macro_rules! impl_default {
+    // struct entry
+    (
+        $(#[$attr:meta])*
+        $vis:vis struct $name:ident { $($body:tt)* }
+    ) => {
+        impl_default! {
+            @struct
+            attrs: { $(#[$attr])* }
+            vis: { $vis }
+            name: { $name }
+            stripped: { }
+            inits: { }
+            rest: { $($body)* }
+        }
+    };
+
+    // struct field led by #[custom_default(...)]
+    (
+        @struct
+        attrs: { $($attr:tt)* }
+        vis: { $vis:vis }
+        name: { $name:ident }
+        stripped: { $($stripped:tt)* }
+        inits: { $($inits:tt)* }
+        rest: {
+            #[custom_default($default:expr)]
+            $(#[$fattr:meta])*
+            $fvis:vis $fname:ident: $fty:ty,
+            $($tail:tt)*
+        }
+    ) => {
+        impl_default! {
+            @struct
+            attrs: { $($attr)* }
+            vis: { $vis }
+            name: { $name }
+            stripped: { $($stripped)* $(#[$fattr])* $fvis $fname: $fty, }
+            inits: { $($inits)* $fname: $default, }
+            rest: { $($tail)* }
+        }
+    };
+
+    // struct plain field
+    (
+        @struct
+        attrs: { $($attr:tt)* }
+        vis: { $vis:vis }
+        name: { $name:ident }
+        stripped: { $($stripped:tt)* }
+        inits: { $($inits:tt)* }
+        rest: {
+            $(#[$fattr:meta])*
+            $fvis:vis $fname:ident: $fty:ty,
+            $($tail:tt)*
+        }
+    ) => {
+        impl_default! {
+            @struct
+            attrs: { $($attr)* }
+            vis: { $vis }
+            name: { $name }
+            stripped: { $($stripped)* $(#[$fattr])* $fvis $fname: $fty, }
+            inits: { $($inits)* $fname: ::core::default::Default::default(), }
+            rest: { $($tail)* }
+        }
+    };
+
+    // struct done
+    (
+        @struct
+        attrs: { $($attr:tt)* }
+        vis: { $vis:vis }
+        name: { $name:ident }
+        stripped: { $($stripped:tt)* }
+        inits: { $($inits:tt)* }
+        rest: { }
+    ) => {
+        #[repr(C)]
+        #[::core::prelude::v1::derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
+        $($attr)*
+        $vis struct $name { $($stripped)* }
+
+        impl ::core::default::Default for $name {
+            fn default() -> Self {
+                Self { $($inits)* }
+            }
+        }
+    };
+
+    // union entry, always zeroed default for now
+    (
+        $(#[$attr:meta])*
+        $vis:vis union $name:ident { $($body:tt)* }
+    ) => {
+        #[repr(C)]
+        #[::core::prelude::v1::derive(::core::clone::Clone, ::core::marker::Copy)]
+        $(#[$attr])*
+        $vis union $name { $($body)* }
+
+        impl ::core::fmt::Debug for $name {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                f.debug_struct(::core::stringify!($name)).finish_non_exhaustive()
+            }
+        }
+
+        impl ::core::default::Default for $name {
+            fn default() -> Self {
+                // SAFETY: all-zero is a valid value for the plain-data C unions libc wraps.
+                unsafe { ::core::mem::zeroed() }
+            }
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use core::any::TypeId;
@@ -594,5 +715,129 @@ mod macro_checks {
             pub a: u32,
             b: f32,
         }
+    }
+}
+
+#[cfg(test)]
+mod impl_default_spike {
+    impl_default! {
+        pub struct PlainStruct {
+            pub a: i32,
+            pub b: u64,
+        }
+    }
+
+    impl_default! {
+        pub struct BigArrayStruct {
+            pub id: u32,
+            #[custom_default([0; 64])]
+            pub small: [u8; 64],
+            #[custom_default([0; 2048])]
+            pub big: [u8; 2048],
+        }
+    }
+
+    impl_default! {
+        pub union SpikeUnion {
+            pub a: u32,
+            pub b: f32,
+        }
+    }
+
+    impl_default! {
+        pub struct ContainsUnion {
+            pub family: u16,
+            pub addr: SpikeUnion,
+        }
+    }
+
+    #[test]
+    fn plain_struct_default() {
+        let s = PlainStruct::default();
+        assert_eq!(s.a, 0);
+        assert_eq!(s.b, 0);
+    }
+
+    #[test]
+    fn big_array_default() {
+        let s = BigArrayStruct::default();
+        assert_eq!(s.id, 0);
+        assert_eq!(s.small, [0u8; 64]);
+        assert!(s.big.iter().all(|&x| x == 0));
+    }
+
+    #[test]
+    fn union_and_container_default() {
+        let u = SpikeUnion::default();
+        assert_eq!(unsafe { u.a }, 0);
+        let c = ContainsUnion::default();
+        assert_eq!(c.family, 0);
+        assert_eq!(unsafe { c.addr.a }, 0);
+    }
+
+    // Proves `s!`-style dispatch. Per-item muncher matches `#[skip_derive_default]` as a
+    // literal token before capturing attrs as `:meta`. Mixing marked and unmarked items in
+    // one block is the real usage shape.
+    macro_rules! s_dispatch_demo {
+        () => {};
+        (
+            #[skip_derive_default]
+            $(#[$attr:meta])*
+            $vis:vis struct $name:ident { $($body:tt)* }
+            $($rest:tt)*
+        ) => {
+            impl_default! { $(#[$attr])* $vis struct $name { $($body)* } }
+            s_dispatch_demo! { $($rest)* }
+        };
+        (
+            #[skip_derive_default]
+            $(#[$attr:meta])*
+            $vis:vis union $name:ident { $($body:tt)* }
+            $($rest:tt)*
+        ) => {
+            impl_default! { $(#[$attr])* $vis union $name { $($body)* } }
+            s_dispatch_demo! { $($rest)* }
+        };
+        (
+            $(#[$attr:meta])*
+            $vis:vis struct $name:ident { $($body:tt)* }
+            $($rest:tt)*
+        ) => {
+            #[repr(C)]
+            #[derive(Clone, Copy, Debug)]
+            $(#[$attr])*
+            $vis struct $name { $($body)* }
+            s_dispatch_demo! { $($rest)* }
+        };
+    }
+
+    s_dispatch_demo! {
+        // not marked: plain derive, no Default
+        pub struct NoDefault {
+            pub x: i32,
+        }
+
+        #[skip_derive_default]
+        pub struct Marked {
+            pub x: i32,
+            #[custom_default([0; 48])]
+            pub buf: [u8; 48],
+        }
+
+        #[skip_derive_default]
+        pub union MarkedUnion {
+            pub a: u32,
+            pub b: i32,
+        }
+    }
+
+    #[test]
+    fn dispatch_routes_marked_items() {
+        let m = Marked::default();
+        assert_eq!(m.x, 0);
+        assert_eq!(m.buf, [0u8; 48]);
+        assert_eq!(unsafe { MarkedUnion::default().a }, 0);
+        // NoDefault intentionally has no Default impl; it still exists as a plain struct.
+        let _ = NoDefault { x: 1 };
     }
 }
